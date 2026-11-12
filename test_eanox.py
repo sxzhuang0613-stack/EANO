@@ -8,7 +8,7 @@ import torch
 
 from EANO.components import CODALayer, DWT3d, EANOX, WaveletConv3d
 from EANO.losses import EANOXLoss
-from EANO.main import make_checkpoint, make_optimizer, restore, run_epoch, synthetic_batches
+from EANO.main import make_checkpoint, make_optimizer, restore, run_epoch, synthetic_batches, save_latest_checkpoint
 from EANO.ulits import (SequenceWindow, accumulate, atomic_save, deformation,
                         load_config, seed_everything, warp)
 
@@ -187,6 +187,16 @@ class EANOXTests(unittest.TestCase):
             incompatible['sequence']['cyclic'] = False
             with self.assertRaises(ValueError):
                 restore(path, restored, restored_loss, incompatible)
+
+    def test_only_latest_training_checkpoint_is_retained(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            for name in ('best.pt', 'epoch_0001.pt', 'epoch_0002.pt', 'prediction.pt'):
+                atomic_save({'epoch': 0}, output / name)
+            save_latest_checkpoint({'epoch': 3}, output)
+            save_latest_checkpoint({'epoch': 4}, output)
+            self.assertEqual({path.name for path in output.glob('*.pt')}, {'last.pt', 'prediction.pt'})
+            self.assertEqual(torch.load(output / 'last.pt', weights_only=True)['epoch'], 4)
 
 
 if __name__ == '__main__':

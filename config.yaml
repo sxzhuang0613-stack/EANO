@@ -11,7 +11,7 @@ data:
   # 默认按切片；3D 时每个病例逐切片计算，按全病例切片数平均梯度。
   dim: 2D
   batch_size: 1
-  num_workers: 4
+  num_workers: 0
   pin_memory: true
   # 当前 loader 的增强分支未真正执行空间变换，暂不启用。
   augmentation: false
@@ -98,8 +98,7 @@ training:
   eta_min: 0.000001
   step_size: 50
   gamma: 0.5
-  validation_interval: 1
-  save_interval: 1
+  # 训练不运行验证，每轮仅覆盖保存 last.pt。
 
 visualization:
   enabled: true

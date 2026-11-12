@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import random
 import sys
+import time
 
 import torch
 from tqdm.auto import tqdm
@@ -29,6 +30,47 @@ def scalar_record(result):
         record.update({section + '/' + key: float(value.detach())
                        for key, value in result[section].items()})
     return record
+
+
+def print_epoch_losses(epoch, config, stats, learning_rate, seconds, visualization=None):
+    """按列输出本轮训练均值，同时区分原始损失和实际加权贡献。"""
+    labels = {
+        'forward_recon_loss': '正向相邻配准', 'backward_recon_loss': '反向相邻配准',
+        'forward_lag_recon_loss': '正向累计配准', 'backward_lag_recon_loss': '反向累计配准',
+        'optical_flow_loss': '双向光流约束', 'hyperelastic_loss': '正向力学约束',
+        'smoothness_loss': '正向形变正则', 'photometric': '双向光度约束',
+        'equilibrium': '应力平衡', 'constitutive': '本构一致性',
+        'alignment_global': '双向累计配准', 'alignment_adjacent': '双向相邻配准',
+    }
+    line = '─' * 64
+    print(f'\n{line}\nEpoch {epoch:03d}/{config["training"]["epochs"]}  |  '
+          f'{config["losses"]["group"]}  |  lr={learning_rate:.3e}  |  {seconds:.1f}s')
+    print(f'训练总损失：{stats["total"]:.6f}\n{line}')
+    print('损失项                        原始值          加权贡献')
+    for key, value in stats.items():
+        if not key.startswith('terms/'):
+            continue
+        name = key.split('/', 1)[1]
+        label = labels.get(name, name)
+        # 中文字符按双列宽补齐，避免中英文混排导致表格错位。
+        width = sum(2 if ord(char) > 127 else 1 for char in label)
+        padded = label + ' ' * max(1, 26 - width)
+        contribution = stats.get('contributions/' + name, 0.0)
+        print(f'{padded}{value:>14.6g}  {contribution:>14.6g}')
+    print(line)
+    if visualization is not None:
+        print(f'累计位移图：{visualization["path"]}')
+    print('最新权重：last.pt（覆盖保存）\n', flush=True)
+
+
+def save_latest_checkpoint(payload, output):
+    """成功覆盖最新检查点后，清理本程序旧策略产生的历史权重。"""
+    import re
+    output = Path(output)
+    atomic_save(payload, output / 'last.pt')
+    for path in output.iterdir():
+        if path.is_file() and (path.name == 'best.pt' or re.fullmatch(r'epoch_\d+\.pt', path.name)):
+            path.unlink()
 
 
 def run_epoch(model, objective, loader, config, device, optimizer=None, epoch=None):
@@ -117,11 +159,12 @@ def make_optimizer(model, objective, config):
     return optimizer, scheduler
 
 
-def make_checkpoint(model, objective, optimizer, scheduler, config, epoch, best):
+def make_checkpoint(model, objective, optimizer, scheduler, config, epoch, best=None):
+    """保留旧 best 调用参数以兼容已有调用，但不再存储最佳验证结果。"""
     return {'format_version': 1, 'model': model.state_dict(),
             'objective': objective.state_dict(), 'optimizer': optimizer.state_dict(),
             'scheduler': scheduler.state_dict() if scheduler is not None else None,
-            'config': copy.deepcopy(config), 'epoch': epoch, 'best': best,
+            'config': copy.deepcopy(config), 'epoch': epoch,
             'torch_rng': torch.get_rng_state(), 'python_rng': random.getstate(),
             'cuda_rng': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None}
 
@@ -134,7 +177,12 @@ def restore(path, model, objective, config, optimizer=None, scheduler=None):
     sections = ('model', 'sequence', 'losses', 'data', 'dataset_name',
                 'dataset_paths', 'train_fraction', 'normalization_epsilon', 'data_protocol')
     for section in sections:
-        if checkpoint['config'].get(section) != config.get(section):
+        previous, current = checkpoint['config'].get(section), config.get(section)
+        # 兼容旧版记录验证集的检查点；恢复训练只核对实际使用的训练集合。
+        if section == 'data_protocol' and optimizer is not None:
+            previous = previous.get('train') if previous else None
+            current = current.get('train') if current else None
+        if previous != current:
             raise ValueError("Checkpoint configuration mismatch: " + section)
     model.load_state_dict(checkpoint['model'])
     objective.load_state_dict(checkpoint['objective'])
@@ -195,16 +243,12 @@ def main():
         config['training'].update(epochs=1, accumulation_steps=3)
     if config['training']['epochs'] < 1:
         raise ValueError("epochs must be positive")
-    if min(config['training']['validation_interval'], config['training']['save_interval']) < 1:
-        raise ValueError("validation_interval and save_interval must be positive")
     seed_everything(config['runtime']['seed'])
     # 在构建大模型前检查真实数据接口，同时记录病例划分。
-    train_loader = val_loader = None
+    train_loader = None
     if args.mode == 'train' and not args.smoke:
         train_loader = build_dataloader(config, 'train')
-        val_loader = build_dataloader(config, 'val')
-        config['data_protocol'] = {'train': data_protocol(config, train_loader),
-                                   'val': data_protocol(config, val_loader)}
+        config['data_protocol'] = {'train': data_protocol(config, train_loader)}
     requested_device = config['runtime']['device']
     device = torch.device(('cuda' if torch.cuda.is_available() else 'cpu') if requested_device == 'auto' else requested_device)
     if device.type == 'cpu':
@@ -227,7 +271,8 @@ def main():
         objective.eval()
         if args.mode == 'validate':
             loader = synthetic_batches(config) if args.smoke else build_dataloader(config, 'val')
-            if not args.smoke and config.get('data_protocol', {}).get('val') != data_protocol(config, loader):
+            expected = config.get('data_protocol', {}).get('val')
+            if not args.smoke and expected is not None and expected != data_protocol(config, loader):
                 raise ValueError('当前验证病例集合与检查点不一致')
             stats = run_epoch(model, objective, loader, config, device)
             (output / 'validation.json').write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding='utf-8')
@@ -253,38 +298,29 @@ def main():
         raise FileExistsError("Output directory already contains training results; use resume or a new directory")
     if args.smoke:
         train_loader = synthetic_batches(config)
-        val_loader = synthetic_batches(config, count=1)
     optimizer, scheduler = make_optimizer(model, objective, config)
-    start, best = 0, float('inf')
+    start = 0
     if path:
         checkpoint = restore(path, model, objective, config, optimizer, scheduler)
-        start, best = checkpoint['epoch'], checkpoint['best']
+        start = checkpoint['epoch']
     (output / 'config.json').write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding='utf-8')
     for epoch in range(start, config['training']['epochs']):
+        started = time.perf_counter()
+        learning_rate = optimizer.param_groups[0]['lr']
         train_stats = run_epoch(model, objective, train_loader, config, device, optimizer, epoch=epoch + 1)
-        val_stats = None
-        improved = False
-        if (epoch + 1) % config['training']['validation_interval'] == 0:
-            val_stats = run_epoch(model, objective, val_loader, config, device, epoch=epoch + 1)
-            improved = val_stats['total'] < best
-            if improved:
-                best = val_stats['total']
         if scheduler is not None:
             scheduler.step()
         # 使用本轮更新后的模型另做一次无梯度预测，每轮覆盖同一张图。
         visualization = save_epoch_visualization(model, train_loader, config, device, output, epoch + 1)
-        record = {'epoch': epoch + 1, 'train': train_stats, 'val': val_stats}
+        record = {'epoch': epoch + 1, 'train': train_stats}
         if visualization is not None:
             record['visualization'] = visualization
         with (output / 'history.jsonl').open('a', encoding='utf-8') as stream:
             stream.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + '\n')
-        checkpoint = make_checkpoint(model, objective, optimizer, scheduler, config, epoch + 1, best)
-        atomic_save(checkpoint, output / 'last.pt')
-        if improved:
-            atomic_save(checkpoint, output / 'best.pt')
-        if (epoch + 1) % config['training']['save_interval'] == 0:
-            atomic_save(checkpoint, output / ('epoch_%04d.pt' % (epoch + 1)))
-        print(json.dumps(record, ensure_ascii=False, allow_nan=False), flush=True)
+        checkpoint = make_checkpoint(model, objective, optimizer, scheduler, config, epoch + 1)
+        save_latest_checkpoint(checkpoint, output)
+        print_epoch_losses(epoch + 1, config, train_stats, learning_rate,
+                           time.perf_counter() - started, visualization)
 
 
 if __name__ == '__main__':

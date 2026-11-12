@@ -20,7 +20,8 @@ def load_config(path):
 def seed_everything(seed):
     import numpy as np
     random.seed(seed)
-    np.random.seed(seed)
+    # NumPy 只接受 32 位种子，兼容配置中用于 PyTorch 的较大整数。
+    np.random.seed(seed % (2 ** 32))
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)

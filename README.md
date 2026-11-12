@@ -23,6 +23,13 @@
 训练和验证进度条默认开启，可在配置中设置 `training.progress_bar: false`，
 或运行时添加 `--no-progress-bar` 关闭，`--progress-bar` 显式开启。
 
+训练循环只运行训练，不构造或运行验证/测试集。每轮结束后在终端按表格输出
+总损失、各项原始损失和加权贡献，同时显示学习率与耗时；完整历史仍写入
+`history.jsonl`。检查点只保留覆盖更新的 `last.pt`，不再保存最佳或逐轮权重。
+在同一输出目录恢复训练后，成功保存最新检查点时会清理旧策略产生的
+`best.pt` 与 `epoch_数字.pt`；预测结果等其他文件不受影响。
+独立的 `--mode validate` 仍可在需要时手动运行。
+
 每轮结束后使用更新后的模型，从训练集随机选择一个切片时间序列，绘制第一帧
 至各帧的累计前向位移。全部帧拼在同一张 `输出目录/displacement_hsv.png` 中，
 新一轮覆盖旧图。第一幅为白色恒等参考帧；周期模式最后一幅保留完整周期闭合
@@ -50,8 +57,8 @@
 
 ```bash
 python EANO/main.py --config EANO/config.yaml --output-dir outputs/run01
-python EANO/main.py --config EANO/config.yaml --mode validate --checkpoint outputs/run01/best.pt
-python EANO/main.py --config EANO/config.yaml --mode predict --checkpoint outputs/run01/best.pt --input sequence.pt
+python EANO/main.py --config EANO/config.yaml --mode validate --checkpoint outputs/run01/last.pt
+python EANO/main.py --config EANO/config.yaml --mode predict --checkpoint outputs/run01/last.pt --input sequence.pt
 ```
 
 预测输入文件可以是图像张量，也可以是包含配置指定图像键的字典。
@@ -79,8 +86,8 @@ loader 已完成完整病例归一化和固定 128×128 缩放，适配层不再
 当前 loader 的增强分支未执行实际空间变换，适配器要求关闭增强。
 
 EANOX 使用 `config_utils.load_eanox_config`，不触发原渲染项目的配置检查。
-数据目录的相对路径以配置文件目录为基准。检查点记录数据集、路径、训练/验证
-患者列表及预处理参数，恢复训练或独立验证时核对，避免悄悄改变实验划分。
+数据目录的相对路径以配置文件目录为基准。检查点记录数据集、路径、
+训练患者列表及预处理参数，恢复训练时核对，避免悄悄改变实验划分。
 
 - 输入图像：`[B,1,T,H,W]`，已预处理的有限浮点数，T 至少为 2；模型不二次归一化。
 - 空间尺寸固定为 `model.input_size`；同一批内时间长度一致。
